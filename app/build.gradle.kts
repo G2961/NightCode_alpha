@@ -53,4 +53,7 @@ dependencies {
     implementation("androidx.activity:activity-ktx:1.10.0")
     implementation("androidx.webkit:webkit:1.12.1")
     implementation("androidx.documentfile:documentfile:1.0.1")
+    // mwiede's JSch fork: SSH/SFTP with modern ciphers (original 0.1.x JSch
+    // fails kex negotiation against current Ubuntu/OpenSSH servers).
+    implementation("com.github.mwiede:jsch:2.27.9")
 }

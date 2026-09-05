@@ -27,7 +27,10 @@ const state={
   sessions:JSON.parse(localStorage.getItem("sessions")||"[]"),
   projects:JSON.parse(localStorage.getItem("projects")||"[]"),
   extEnabled:JSON.parse(localStorage.getItem("extEnabled")||"{}"),
-  extInline:JSON.parse(localStorage.getItem("extInline")||"[]")
+  extInline:JSON.parse(localStorage.getItem("extInline")||"[]"),
+  ghToken:localStorage.getItem("ghToken")||"",
+  ghUser:localStorage.getItem("ghUser")||"",
+  ghClientId:localStorage.getItem("ghClientId")||""
 };
 
 function save(){
@@ -61,6 +64,9 @@ function save(){
   localStorage.setItem("projects",JSON.stringify(state.projects));
   localStorage.setItem("extEnabled",JSON.stringify(state.extEnabled));
   localStorage.setItem("extInline",JSON.stringify(state.extInline));
+  localStorage.setItem("ghToken",state.ghToken);
+  localStorage.setItem("ghUser",state.ghUser);
+  localStorage.setItem("ghClientId",state.ghClientId);
 }
 
 /* ── System banner (non-chat status messages) ── */
@@ -376,6 +382,139 @@ function fsCall(method,...args){
     try{Android[method](...args,cbId)}catch(e){delete fsCbs[cbId];resolve({result:String(e),error:true})}
   });
 }
+/* ── Android SSH bridge (agent remote access over one persistent session) ── */
+const sshCbs={};let sshCbId=0;
+window.__sshData=function(cbId,line){
+  const cb=sshCbs[cbId];if(cb&&cb.onLine)cb.onLine(String(line));
+};
+window.__sshDone=function(cbId,code,msg,error){
+  const cb=sshCbs[cbId];if(!cb)return;
+  delete sshCbs[cbId];
+  cb.onDone({code,msg,error:!!error});
+};
+function sshCall(op,...args){
+  return new Promise(resolve=>{
+    // Accepts op keys ("upload") AND agent tool names ("ssh_upload") —
+    // mixing them up previously resolved to NO_BRIDGE even with a live bridge.
+    const method={connect:"sshConnect",disconnect:"sshDisconnect",exec:"sshExec",upload:"sshUpload",download:"sshDownload",ssh_exec:"sshExec",ssh_upload:"sshUpload",ssh_download:"sshDownload"}[op];
+    if(!window.Android||!Android[method]){resolve({code:-1,msg:"NO_BRIDGE (SSH works in the Android app)",error:true,output:[]});return}
+    const cbId="ssh"+(++sshCbId);
+    const lines=[];
+    sshCbs[cbId]={onLine:l=>lines.push(String(l)),onDone:r=>resolve({...r,output:lines})};
+    try{Android[method](...args,cbId)}
+    catch(e){delete sshCbs[cbId];resolve({code:-1,msg:String(e&&e.message||e),error:true,output:[]})}
+  });
+}
+function sshExecCollect(command,timeoutSec){
+  // exec variant that keeps every output line (for the agent tool result)
+  return new Promise(resolve=>{
+    if(!window.Android||!Android.sshExec){resolve({code:-1,msg:"NO_BRIDGE (SSH works in the Android app)",error:true,output:[]});return}
+    const cbId="ssh"+(++sshCbId);
+    const lines=[];
+    sshCbs[cbId]={onLine:l=>lines.push(String(l)),onDone:r=>resolve({...r,output:lines})};
+    try{Android.sshExec(command,timeoutSec||120,cbId)}
+    catch(e){delete sshCbs[cbId];resolve({code:-1,msg:String(e&&e.message||e),error:true,output:[]})}
+  });
+}
+async function sshEnsureConnected(){
+  if(window.Android&&Android.sshIsConnected&&Android.sshIsConnected())return {ok:true};
+  if(!window.Android||!Android.sshConnect)return {ok:false,msg:"NO_BRIDGE"};
+  const r=await sshCall("connect","");
+  return r.error?{ok:false,msg:r.msg}:{ok:true};
+}
+const SSH_TOOLS=[
+  {name:"ssh_exec",description:"Run a shell command on the connected SSH server (usually Ubuntu). Returns the command output and exit code. Requires SSH configured in Settings → SSH.",input_schema:{type:"object",properties:{command:{type:"string",description:"Shell command, e.g. 'ls -la /var/www'"},timeoutSec:{type:"integer",description:"Optional timeout in seconds (default 120)"}},required:["command"]}},
+  {name:"ssh_upload",description:"Upload a file from the connected project folder to the SSH server via SFTP. Creates remote directories as needed.",input_schema:{type:"object",properties:{localPath:{type:"string",description:"Path inside the project, e.g. 'app.py'"},remotePath:{type:"string",description:"Absolute remote path, e.g. '/var/www/app/app.py'"}},required:["localPath","remotePath"]}},
+  {name:"ssh_download",description:"Download a file from the SSH server into the connected project folder via SFTP.",input_schema:{type:"object",properties:{remotePath:{type:"string"},localPath:{type:"string",description:"Path inside the project where the file lands"}},required:["remotePath","localPath"]}}
+];
+function sshToolsAvailable(){
+  if(window.Android&&Android.sshIsConnected&&Android.sshIsConnected())return true;
+  return !!(window.Android&&Android.sshSavedHost&&Android.sshSavedHost());
+}
+async function sshRunTool(name,input){
+  const ensure=await sshEnsureConnected();
+  if(!ensure.ok)return {result:"SSH_NOT_CONNECTED: "+(ensure.msg||"")+". Configure it in Settings → SSH.",error:true};
+  if(name==="ssh_exec"){
+    const r=await sshExecCollect(String(input.command||""),Number(input.timeoutSec)||120);
+    const out=(r.output||[]).join("\n");
+    if(r.error)return {result:(out?out+"\n":"")+String(r.msg||"SSH error"),error:true};
+    return {result:"exit code: "+r.code+(out?"\n"+out:"\n(no output)"),error:false};
+  }
+  if(name==="ssh_upload"||name==="ssh_download"){
+    const a=name==="ssh_upload"?[String(input.localPath||""),String(input.remotePath||"")]:[String(input.remotePath||""),String(input.localPath||"")];
+    const r=await sshCall(name,a[0],a[1]);
+    const text=[...(r.output||[]),String(r.msg||"")].filter(Boolean).join("\n");
+    return {result:text||"OK",error:!!r.error};
+  }
+  return {result:"UNKNOWN_SSH_TOOL",error:true};
+}
+
+/* ── GitHub auth + API (device flow OAuth or PAT) ── */
+const GH_API="https://api.github.com";
+async function ghRequest(method,path,body,rawHeaders){
+  if(!state.ghToken)return {status:401,body:"NOT_AUTHENTICATED (Settings → GitHub)",error:true};
+  const headers=Object.assign({"authorization":"Bearer "+state.ghToken,"accept":"application/vnd.github+json","user-agent":"NightCode","x-github-api-version":"2022-11-28"},rawHeaders||{});
+  const r=await httpFetch(method,GH_API+path,headers,body?JSON.stringify(body):"");
+  return {status:r.status,body:r.body,error:r.error||r.status>=400};
+}
+/* Device Flow (OAuth for installed apps — no client secret, no redirect URI).
+   Step 1: POST https://github.com/login/device/code → user_code + device_code.
+   Step 2: user opens github.com/login/device in a browser (already logged in),
+   enters the code, grants. Step 3: poll POST github.com/login/oauth/access_token
+   until "authorization_pending" turns into an access_token. */
+async function ghDeviceStart(){
+  if(!state.ghClientId)return {error:"NO_CLIENT_ID — paste an OAuth App Client ID in Settings → GitHub (github.com/settings/developers → New OAuth App, callback URL can be anything)"};
+  const r=await httpFetch("POST","https://github.com/login/device/code",{"content-type":"application/json","accept":"application/json","user-agent":"NightCode"},JSON.stringify({client_id:state.ghClientId,scope:"repo gist read:org"}));
+  if(r.error||r.status>=400)return {error:"GitHub device code failed: HTTP "+r.status+" "+(r.body||"").slice(0,200)};
+  try{
+    const d=JSON.parse(r.body);
+    if(d.error)return {error:"GitHub: "+d.error+" — "+(d.error_description||"")};
+    return d; // {device_code,user_code,verification_uri,interval,expires_in}
+  }catch(e){return {error:"Bad response from GitHub"}}
+}
+async function ghDevicePoll(deviceCode,intervalSec){
+  const wait=(intervalSec||5)*1000;
+  for(let i=0;i<40;i++){ // ~7 min max (GitHub expires codes in 15)
+    await new Promise(res=>setTimeout(res,wait));
+    const r=await httpFetch("POST","https://github.com/login/oauth/access_token",{"content-type":"application/json","accept":"application/json","user-agent":"NightCode"},JSON.stringify({client_id:state.ghClientId,device_code:deviceCode,grant_type:"urn:ietf:params:oauth:grant-type:device_code"}));
+    if(r.error)continue;
+    try{
+      const d=JSON.parse(r.body);
+      if(d.access_token)return {token:d.access_token};
+      if(d.error==="authorization_pending")continue;
+      if(d.error==="slow_down"){await new Promise(res=>setTimeout(res,3000));continue}
+      return {error:"GitHub: "+d.error}; // expired_token / access_denied / unsupported...
+    }catch(e){}
+  }
+  return {error:"Timed out waiting for authorization"};
+}
+async function ghFetchLogin(){
+  const r=await ghRequest("GET","/user");
+  if(r.error)return null;
+  try{return JSON.parse(r.body).login||null}catch(e){return null}
+}
+async function ghSaveToken(token){
+  state.ghToken=token;save();
+  state.ghUser=await ghFetchLogin()||"";save();
+  return state.ghUser;
+}
+/* Agent tool: GitHub REST with token. Auto-JSONifies, truncates, wraps errors. */
+const GITHUB_TOOL={name:"github_api",description:"Call the GitHub REST API as the authenticated user (token configured in Settings → GitHub). Works with repos, files, issues, pull requests, releases, search.",input_schema:{type:"object",properties:{method:{type:"string",enum:["GET","POST","PATCH","PUT","DELETE"],description:"HTTP method, default GET"},path:{type:"string",description:"API path, e.g. /repos/{owner}/{repo}/contents/{path} or /user"},body:{type:"object",description:"JSON body for POST/PATCH/PUT"}},required:["path"]}};
+function ghToolsAvailable(){return !!state.ghToken}
+async function ghRunTool(input){
+  const method=(String(input.method||"GET")).toUpperCase();
+  const path=String(input.path||"");
+  if(!path)return {result:"path required",error:true};
+  if(!/^https?:\/\//.test(path)&&!path.startsWith("/"))return {result:"path must start with / (or be a full URL)",error:true};
+  // Basic guardrail: no changing auth settings / deleting accounts via API.
+  if(/authorization/i.test(path))return {result:"Not allowed",error:true};
+  const r=await ghRequest(method,path.startsWith("/")?path:path.replace(GH_API,""),input.body||null);
+  let out=String(r.body||"");
+  try{out=JSON.stringify(JSON.parse(out),null,1)}catch(e){}
+  if(out.length>12000)out=out.slice(0,12000)+"\n… (truncated)";
+  return {result:"HTTP "+r.status+"\n"+out,error:!!r.error};
+}
+
 async function openProject(){
   if(window.Android&&Android.openProjectPicker){Android.openProjectPicker()}
   else alert("Project folders are available in the Android app.");
@@ -840,6 +979,8 @@ async function send(override,targetId){
       :ws
       ?"You are NightCode, a local AI coding agent. No project is currently open, but a projects folder is connected — do NOT use file tools proactively, only when the user's message actually asks for it. If the user asks you to build/create something new, first call create_directory with a short kebab-case name for the new project (e.g. \"my-app\"), then create all its files as paths INSIDE that directory (e.g. \"my-app/index.html\") — never write files directly at the root. If the user instead refers to continuing/opening an existing project, tell them to pick it from Projects in the menu; you cannot switch projects yourself. Be concise. Use web_search whenever fresh information would help."
       :"You are NightCode, a helpful AI assistant. There is no project folder connected, so do not assume access to local files. You have the web_search tool — use it only when the user's question actually needs current information; do not search proactively on greetings or general chat. Cite source URLs when you do search.")
+      +(sshToolsAvailable()?" An SSH server is configured: use ssh_exec to run commands on it, ssh_upload to copy project files to it, ssh_download to fetch remote files. Destructive commands (rm -rf, service restarts, package removal) require explicit user confirmation first.":"")
+      +(ghToolsAvailable()?" GitHub is authenticated: use github_api for repositories, files (GET /repos/{owner}/{repo}/contents/{path}), issues, PRs, releases and search as the user.":"")
       +(state.summary?`\nConversation summary:\n${state.summary}\nContinue the same conversation.`:"");
     let final="";const toolCalls=[];let allThinking="";
     let liveCard=null;
@@ -878,7 +1019,9 @@ async function send(override,targetId){
       // workspace folder (so the model can create a new project inside it).
       const webTools=(state.searchProvider!=="free"&&state.ollamaKey)?[WEB_SEARCH_TOOL,WEB_FETCH_TOOL]:[WEB_SEARCH_TOOL];
       // Extension tools ride along in every mode — they may not need a project.
-      body.tools=[...((proj||hasWorkspace())?FILE_TOOLS:[]),...webTools,...extToolDefs()];
+      // SSH tools appear only when a connection is configured, so the model
+      // isn't tempted to use them against nothing.
+      body.tools=[...((proj||hasWorkspace())?FILE_TOOLS:[]),...webTools,...(sshToolsAvailable()?SSH_TOOLS:[]),...(ghToolsAvailable()?[GITHUB_TOOL]:[]),...extToolDefs()];
       const reqUrl=state.base.replace(/\/$/,"")+"/v1/messages";
       // Full SSE parser: collects thinking, text AND tool_use blocks straight from
       // the stream (content_block_start carries id/name, input_json_delta carries
@@ -1279,6 +1422,8 @@ async function runTool(name,input){
     return {result:("URL: "+url+"\n\n"+text).slice(0,12000),error:false};
   }
   if(name==="list_files")return fsCall("fsList","");
+  if(name==="ssh_exec"||name==="ssh_upload"||name==="ssh_download")return sshRunTool(name,input);
+  if(name==="github_api")return ghRunTool(input);
   if(name==="read_file")return fsCall("fsRead",input.path);
   if(name==="search_files")return fsCall("fsSearch",input.query);
   if(name==="write_file")return fsCall("fsWrite",input.path,btoa(unescape(encodeURIComponent(String(input.content||"")))));
@@ -1296,8 +1441,8 @@ function hasWorkspace(){
 
 /* ── Console: Shell over the connected folder + JS REPL + log viewer ── */
 const CON={tab:"shell",welcomed:false,
-  hist:{shell:JSON.parse(localStorage.getItem("ncHistShell")||"[]"),js:JSON.parse(localStorage.getItem("ncHistJs")||"[]")},
-  hi:{shell:-1,js:-1}};
+  hist:{shell:JSON.parse(localStorage.getItem("ncHistShell")||"[]"),js:JSON.parse(localStorage.getItem("ncHistJs")||"[]"),ssh:JSON.parse(localStorage.getItem("ncHistSsh")||"[]")},
+  hi:{shell:-1,js:-1,ssh:-1}};
 const LOGBUF=[];
 const MONO="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace";
 (function patchConsole(){
@@ -1591,29 +1736,74 @@ async function runJsLine(raw){
   const r=await replEval(raw);
   coPrint(r.text,r.ok?"co-ok":"co-err");
 }
+/* ── SSH tab: remote shell over the persistent session ── */
+let sshConsoleBusy=false;
+async function runSshLine(raw){
+  const line=raw.trim();
+  coPrint("ssh$ "+line,"co-cmd");
+  if(!line)return;
+  pushHist("ssh",line);
+  if(line==="help"){
+    coPrint("SSH console — commands run on the remote server.");
+    coPrint("  connect host[:port] user [password]   connect (or use Settings → SSH)","co-dim");
+    coPrint("  status | disconnect                    connection control","co-dim");
+    coPrint("  anything else runs remotely via bash","co-dim");
+    return;
+  }
+  if(line==="status"){
+    coPrint((window.Android&&Android.sshIsConnected&&Android.sshIsConnected())?"connected":(sshToolsAvailable()?"saved config, not connected — run a command to auto-connect":"no SSH config — Settings → SSH"),"co-dim");
+    return;
+  }
+  if(line==="disconnect"){
+    const r=await sshCall("disconnect");
+    coPrint(r.msg||"disconnected",r.error?"co-err":"co-ok");
+    updateConsoleInfo();
+    return;
+  }
+  if(sshConsoleBusy){coPrint("(another command is running — wait)","co-dim");return}
+  sshConsoleBusy=true;
+  try{
+    const ensure=await sshEnsureConnected();
+    if(!ensure.ok){coPrint("SSH not connected: "+(ensure.msg||"")+" — Settings → SSH","co-err");return}
+    updateConsoleInfo();
+    const r=await new Promise(resolve=>{
+      const cbId="ssh"+(++sshCbId);
+      sshCbs[cbId]={onLine:l=>coPrint(String(l)),onDone:resolve};
+      try{Android.sshExec(line,180,cbId)}catch(e){delete sshCbs[cbId];resolve({code:-1,msg:String(e&&e.message||e),error:true})}
+    });
+    if(r.error)coPrint("⚠ "+(r.msg||"error"),"co-err");
+    else if(r.code!==0)coPrint("(exit "+r.code+")","co-dim");
+  }finally{sshConsoleBusy=false;updateConsoleInfo()}
+}
 function pushHist(tab,line){
   if(!line)return;
   const h=CON.hist[tab];
+  if(!h)return;
   if(h[h.length-1]!==line)h.push(line);
   while(h.length>50)h.shift();
-  localStorage.setItem(tab==="shell"?"ncHistShell":"ncHistJs",JSON.stringify(h));
+  localStorage.setItem(tab==="shell"?"ncHistShell":(tab==="ssh"?"ncHistSsh":"ncHistJs"),JSON.stringify(h));
   CON.hi[tab]=-1;
 }
 function setConsoleTab(tab){
   CON.tab=tab;
   document.querySelectorAll(".ctab").forEach(b=>b.classList.toggle("active",b.dataset.ctab===tab));
   $("consoleRow").style.display=tab==="logs"?"none":"flex";
-  $("consolePrompt").textContent=tab==="js"?"js>":shellPrompt();
-  $("consoleInput").placeholder=tab==="js"?"expression (Enter to eval)":"help";
+  $("consolePrompt").textContent=tab==="js"?"js>":(tab==="ssh"?"ssh$":shellPrompt());
+  $("consoleInput").placeholder=tab==="js"?"expression (Enter to eval)":(tab==="ssh"?"command or connect": "help");
   if(tab==="logs")renderLogs();
   else if(!$("consoleOut").children.length)coEmptyState(tab);
 }
 function coEmptyState(tab){
-  coPrint(tab==="js"?"JS REPL — evaluate expressions against the page context. Try `1+1`.":"Shell — runs on the connected folder. Try `help` or `ls`.","co-dim");
+  coPrint(tab==="js"?"JS REPL — evaluate expressions against the page context. Try `1+1`.":(tab==="ssh"?"SSH — remote shell on the connected server. Try `connect` first, then any command.":"Shell — runs on the connected folder. Try `help` or `ls`."),"co-dim");
 }
 function updateConsoleInfo(){
   const el=$("consoleInfo");
-  if(el)el.textContent=state.projectName?("📁 "+state.projectName):"no folder";
+  if(!el)return;
+  if(CON.tab==="ssh"){
+    el.textContent=(window.Android&&Android.sshIsConnected&&Android.sshIsConnected())?"🌐 connected":(sshToolsAvailable()?"SSH saved, not connected":"no SSH");
+    return;
+  }
+  el.textContent=state.projectName?("📁 "+state.projectName):"no folder";
 }
 function openConsole(){
   openSheet("consoleSheet");
@@ -1736,11 +1926,14 @@ const SLASH_BUILTIN={
   compact:{desc:"compact context now",fn(){compactNow(false);showBanner("Context compacted")}},
   tools:{desc:"list agent tools",fn(){
     const base=(hasProject()?FILE_TOOLS.map(t=>t.name):[]).concat(["web_search","web_fetch"]);
+    if(sshToolsAvailable())base.push(...SSH_TOOLS.map(t=>t.name));
+    if(ghToolsAvailable())base.push("github_api");
     const ext=[...EXT.tools.values()].filter(t=>extEnabled(t.ext)).map(t=>t.name);
     addMessage("assistant","Agent tools:\n"+base.concat(ext).join("\n"));
   }},
   ext:{desc:"list extensions",fn(){openSheet("extSheet");renderExtList()}},
   console:{desc:"open console",fn(){openConsole()}},
+  ssh:{desc:"open SSH console",fn(){openConsole();setConsoleTab("ssh")}},
   model:{desc:"choose model",fn(){$("modelBtn").click()}}
 };
 async function handleSlash(prompt){
@@ -1829,11 +2022,15 @@ function toolIcon(name){
     delete_file:'<path d="M5 7h14M9 7V4h6v3M8 10v7M12 10v7M16 10v7M6 7l1 13h10l1-13"/>',
     web_search:'<circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.6 2.3 3.9 5.2 3.9 8.5S14.6 18.2 12 20.5c-2.6-2.3-3.9-5.2-3.9-8.5S9.4 5.8 12 3.5z"/>',
     web_fetch:'<path d="M12 3a9 9 0 1 0 9 9"/><path d="M21 3v6h-6"/>',
+    ssh_exec:'<rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M13 15h4"/>',
+    ssh_upload:'<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M12 15V8M9 11l3-3 3 3"/>',
+    ssh_download:'<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M12 8v7M9 12l3 3 3-3"/>',
+    github_api:'<path d="M10.2 17.3c-2.97-.36-5.06-2.49-5.06-5.26 0-1.12.4-2.34 1.08-3.14-.3-.74-.25-2.31.09-2.97.9-.11 2.11.36 2.83 1.01.85-.27 1.75-.4 2.85-.4s2 .14 2.81.38c.7-.63 1.93-1.1 2.83-.99.32.61.36 2.18.07 2.94.72.85 1.1 2 1.1 3.17 0 2.76-2.09 4.85-5.1 5.23.76.5 1.28 1.57 1.28 2.8v2.34c0 .67.56 1.06 1.24.79C20.07 18.45 23.5 14.38 23.5 9.55 23.5 4.19 18.33 0 12 0S.5 4.19.5 9.55c0 4.99 3.17 9.12 7.43 10.67.61.22 1.19-.18 1.19-.79v-2.36a2.9 2.9 0 0 1-1.08.22c-1.48 0-2.36-.81-2.99-2.31-.25-.61-.52-.97-1.03-1.03-.27-.03-.36-.14-.36-.27 0-.27.45-.47.9-.47.65 0 1.21.4 1.8 1.24.45.65.92.94 1.48.94.56 0 .92-.2 1.44-.72.38-.38.67-.72.94-.94z"/>',
     __ext:'<rect x="4" y="4" width="7" height="7" rx="1.5"/><rect x="13" y="4" width="7" height="7" rx="1.5"/><rect x="4" y="13" width="7" height="7" rx="1.5"/><path d="M16.5 13.5v6M13.5 16.5h6"/>'
   };
   return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">'+(paths[name]||paths.__ext)+'</svg>';
 }
-function toolLabel(name){return ({list_files:'Inspecting project files',read_file:'Reading file',search_files:'Searching project',get_file_info:'Inspecting file',write_file:'Writing file',create_directory:'Creating folder',rename_file:'Renaming file',delete_file:'Deleting file',web_search:'Searching the web',web_fetch:'Reading web page'}[name]||String(name||'').replace(/_/g,' '))}
+function toolLabel(name){return ({list_files:'Inspecting project files',read_file:'Reading file',search_files:'Searching project',get_file_info:'Inspecting file',write_file:'Writing file',create_directory:'Creating folder',rename_file:'Renaming file',delete_file:'Deleting file',web_search:'Searching the web',web_fetch:'Reading web page',ssh_exec:'Running remote command',ssh_upload:'Uploading to server',ssh_download:'Downloading from server',github_api:'Calling GitHub API'}[name]||String(name||'').replace(/_/g,' '))}
 /* Claude-style one-line labels: past tense + target, e.g. Searched "query" */
 function toolCompactLabel(t){
   const target=toolTarget(t.input)||"";
@@ -1848,13 +2045,17 @@ function toolCompactLabel(t){
     create_directory:'Created '+short,
     rename_file:'Renamed to '+short,
     delete_file:'Deleted '+short,
-    get_file_info:'Inspected '+short
+    get_file_info:'Inspected '+short,
+    ssh_exec:'Ran `'+short+'` on server',
+    ssh_upload:'Uploaded '+short,
+    ssh_download:'Downloaded '+short,
+    github_api:'GitHub: '+short
   };
   let label=map[t.name]||toolLabel(t.name);
   if(t.error)label+=" — failed";
   return label;
 }
-function toolTarget(input){return input?.path||input?.to||input?.query||input?.url||input?.url||''}
+function toolTarget(input){return input?.path||input?.to||input?.query||input?.url||input?.command||input?.remotePath||''}
 function makeTree(text){
   // Root-level view only: directories first, then files. No recursive branches.
   const lines=String(text||"").split("\n").filter(Boolean);
@@ -1946,11 +2147,90 @@ async function createProjectFromInput(){
 $("newProjectBtn").onclick=createProjectFromInput;
 $("newProjectName").addEventListener("keydown",e=>{if(e.key==="Enter"){e.preventDefault();createProjectFromInput()}});
 $("modelBtn").onclick=()=>{openSheet("modelSheet");renderModels()}
-$("moreBtn").onclick=()=>{openSheet("settingsSheet");$("baseUrl").value=state.base;$("apiKey").value=state.key;updateSearchUI();updateWorkspaceUI()}
+function updateSshStatusUI(connected){
+  const el=$("sshStatus");if(!el)return;
+  el.className="key-status";
+  if(connected){el.classList.add("ok");el.textContent="Connected";return}
+  const saved=(window.Android&&Android.sshSavedHost)?Android.sshSavedHost():"";
+  if(saved){
+    try{const c=JSON.parse(saved);el.classList.add("checking");el.textContent="Saved: "+(c.user||"?")+(c.user?"@":"")+(c.host||"")+(c.port&&c.port!==22?":"+c.port:"")}
+    catch(e){el.classList.add("checking");el.textContent="Saved connection"}
+  }else{el.textContent="Not configured"}
+}
+/* ── GitHub auth UI ── */
+function updateGhStatusUI(){
+  const el=$("ghStatus");if(!el)return;
+  el.className="key-status";
+  if(state.ghToken){el.classList.add("ok");el.textContent="Signed in"+(state.ghUser?" as "+state.ghUser:"")}
+  else el.textContent="Not connected";
+}
+let ghDeviceBusy=false;
+async function ghDeviceFlow(){
+  if(ghDeviceBusy)return;
+  if(!state.ghClientId){$("ghClientIdInput").focus();$("ghStatus").className="key-status bad";$("ghStatus").textContent="Enter OAuth Client ID first";return}
+  ghDeviceBusy=true;
+  try{
+  const st=$("ghStatus");st.className="key-status checking";st.textContent="Requesting device code…";
+  const d=await ghDeviceStart();
+  if(d.error){st.className="key-status bad";st.textContent=String(d.error).slice(0,160);return}
+  const code=d.user_code||"";
+  const uri=d.verification_uri||"https://github.com/login/device";
+  if(window.Android&&Android.openUrl)Android.openUrl(uri);
+  else window.open(uri,"_blank");
+  st.className="key-status checking";
+  st.innerHTML='Waiting for approval — enter this code in the browser:<br><b style="font-size:16px;letter-spacing:2px">'+esc(code)+"</b>";
+  const res=await ghDevicePoll(d.device_code,d.interval);
+  if(res.error){st.className="key-status bad";st.textContent=String(res.error).slice(0,160);return}
+  const user=await ghSaveToken(res.token);
+  if(!user){st.className="key-status bad";st.textContent="Token received but /user failed — check scopes";return}
+  updateGhStatusUI();
+  }finally{ghDeviceBusy=false}
+}
+$("ghDeviceBtn").onclick=ghDeviceFlow;
+$("ghPatBtn").onclick=()=>{const r=$("ghPatRow");r.style.display=r.style.display==="none"?"block":"none"};
+$("ghPatSave").onclick=async()=>{
+  const t=$("ghTokenInput").value.trim();
+  if(!t)return;
+  const st=$("ghStatus");st.className="key-status checking";st.textContent="Checking token…";
+  const user=await ghSaveToken(t);
+  if(!user){state.ghToken="";save();st.className="key-status bad";st.textContent="Invalid token";return}
+  $("ghTokenInput").value="";
+  updateGhStatusUI();
+};
+$("ghPatCheck").onclick=async()=>{
+  const st=$("ghStatus");
+  if(!state.ghToken){st.className="key-status bad";st.textContent="No token saved";return}
+  st.className="key-status checking";st.textContent="Checking…";
+  state.ghUser=await ghFetchLogin()||"";save();
+  if(state.ghUser)updateGhStatusUI();else{st.className="key-status bad";st.textContent="Token invalid or expired"}
+};
+$("ghDisconnectBtn").onclick=()=>{state.ghToken="";state.ghUser="";save();updateGhStatusUI()};
+$("ghClientIdInput").addEventListener("change",e=>{state.ghClientId=e.target.value.trim();save()});
+$("moreBtn").onclick=()=>{openSheet("settingsSheet");$("baseUrl").value=state.base;$("apiKey").value=state.key;updateSearchUI();updateWorkspaceUI();updateSshStatusUI(window.Android&&Android.sshIsConnected&&Android.sshIsConnected());$("ghClientIdInput").value=state.ghClientId;updateGhStatusUI()};
+$("sshConnectBtn").onclick=async()=>{
+  if(!window.Android||!Android.sshConnect){alert("SSH is available in the Android app.");return}
+  const host=$("sshHost").value.trim();
+  const user=$("sshUser").value.trim();
+  if(!host||!user){$("sshStatus").textContent="Host and user required";$("sshStatus").className="key-status bad";return}
+  const btn=$("sshConnectBtn");btn.disabled=true;
+  const st=$("sshStatus");st.className="key-status checking";st.textContent="Connecting…";
+  const key=$("sshKey").value.trim();
+  const params={host,port:Number($("sshPort").value.trim())||22,user,password:$("sshPass").value,privateKey:key?btoa(unescape(encodeURIComponent(key))):"",passphrase:"",save:true};
+  const r=await sshCall("connect",JSON.stringify(params));
+  btn.disabled=false;
+  if(r.error){st.className="key-status bad";st.textContent="Failed: "+String(r.msg||"").slice(0,140)}
+  else{st.className="key-status ok";st.textContent="Connected to "+user+"@"+host;$("sshPass").value="";$("sshKey").value=""}
+};
+$("sshDisconnectBtn").onclick=async()=>{await sshCall("disconnect");updateSshStatusUI(false)};
+$("sshForgetBtn").onclick=()=>{
+  if(window.Android&&Android.sshForget)Android.sshForget();
+  updateSshStatusUI(false);
+};
 /* Console & extensions wiring */
 $("consoleClose").onclick=closeSheets;
 $("consoleClear").onclick=()=>{
-  if(CON.tab==="logs"){LOGBUF.length=0;renderLogs()}else{$("consoleOut").innerHTML="";coEmptyState(CON.tab)}
+  if(CON.tab==="logs"){LOGBUF.length=0;renderLogs()}
+  else{$("consoleOut").innerHTML="";coEmptyState(CON.tab);if(CON.tab==="ssh")updateConsoleInfo()}
 };
 document.querySelectorAll(".ctab").forEach(b=>b.onclick=()=>setConsoleTab(b.dataset.ctab));
 $("consoleInput").addEventListener("keydown",e=>{
@@ -1958,7 +2238,9 @@ $("consoleInput").addEventListener("keydown",e=>{
   const hist=CON.hist[CON.tab];
   if(e.key==="Enter"){
     const v=inp.value;inp.value="";
-    if(CON.tab==="shell")runShellLine(v);else runJsLine(v);
+    if(CON.tab==="shell")runShellLine(v);
+    else if(CON.tab==="ssh")runSshLine(v);
+    else runJsLine(v);
   }else if(e.key==="ArrowUp"){
     if(!hist||!hist.length)return;
     e.preventDefault();

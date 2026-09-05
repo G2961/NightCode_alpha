@@ -104,6 +104,42 @@
     <label class="switch-row">Use permanent workspace folder<input id="wsEnabled" type="checkbox"></label>
     <button class="secondary" id="wsPick">Choose workspace folder</button>
     <button class="secondary" id="wsClear">Disconnect workspace</button>
+    <div class="muted-label">SSH server</div>
+    <div class="ssh-grid">
+      <input id="sshHost" placeholder="host" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <input id="sshPort" inputmode="numeric" placeholder="22">
+      <input id="sshUser" placeholder="user" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <input id="sshPass" type="password" placeholder="password (or leave empty for key)">
+    </div>
+    <textarea id="sshKey" class="ext-inline-src" spellcheck="false" placeholder="Optional: private key (OpenSSH/PEM) — paste contents here"></textarea>
+    <div class="row-btns">
+      <button class="secondary" id="sshConnectBtn">Connect</button>
+      <button class="secondary" id="sshDisconnectBtn">Disconnect</button>
+      <button class="secondary" id="sshForgetBtn">Forget</button>
+    </div>
+    <div class="key-status" id="sshStatus">Not configured</div>
+    <div class="muted-label">GitHub</div>
+    <div class="key-status" id="ghStatus">Not connected</div>
+    <div class="row-btns">
+      <button class="secondary" id="ghDeviceBtn">Sign in with browser</button>
+      <button class="secondary" id="ghPatBtn">Paste token</button>
+    </div>
+    <div id="ghPatRow" style="display:none">
+      <label>Personal access token
+        <input id="ghTokenInput" type="password" placeholder="ghp_… / github_pat_…" autocomplete="off">
+      </label>
+      <div class="row-btns">
+        <button class="secondary" id="ghPatSave">Save token</button>
+        <button class="secondary" id="ghPatCheck">Check</button>
+      </div>
+    </div>
+    <label>OAuth Client ID (for browser sign-in)
+      <input id="ghClientIdInput" placeholder="Iv1.xxxx or Ov23xxxx (optional)" autocomplete="off">
+    </label>
+    <div class="row-btns">
+      <button class="secondary" id="ghDisconnectBtn">Sign out</button>
+    </div>
+    <div class="ext-hint">Browser sign-in uses GitHub's device flow: you get a code, open github.com/login/device in any browser where you're logged in, enter the code and approve. Needs a one-time OAuth App Client ID (github.com/settings/developers → New OAuth App; homepage and callback URL can be anything). The token is stored only on this device.</div>
     <div class="muted-label">Advanced</div>
     <button class="sheet-row link" id="extBtn"><span class="row-ico"><svg><use href="#i-ext"/></svg></span>Extensions<span class="row-arrow"><svg><use href="#i-arrow-r"/></svg></span></button>
     <button class="sheet-row link" id="contextBtn"><span class="row-ico"><svg><use href="#i-sliders"/></svg></span>Context &amp; memory<span class="row-arrow"><svg><use href="#i-arrow-r"/></svg></span></button>
@@ -174,6 +210,7 @@
     <div class="console-tabs">
       <button class="ctab active" data-ctab="shell">Shell</button>
       <button class="ctab" data-ctab="js">JS</button>
+      <button class="ctab" data-ctab="ssh">SSH</button>
       <button class="ctab" data-ctab="logs">Logs</button>
       <span class="console-info" id="consoleInfo"></span>
       <button class="icon-btn" id="consoleClear" aria-label="Clear"><svg><use href="#i-trash"/></svg></button>

@@ -2,6 +2,12 @@
 xyeindex.html
 .ref-screenshots/
 
+# Gradle build artifacts
+.gradle/
+build/
+app/build/
+local.properties
+
 # ADB debug artifacts
 screen.png
 ui_dump.xml

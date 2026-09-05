@@ -255,6 +255,10 @@ textarea::placeholder{color:var(--text-3)}
 .sheet select{display:block;width:100%;margin-top:6px;background:#0c0e12;border:1px solid var(--border-strong);border-radius:13px;padding:12px 13px;outline:0;color:var(--text);font-size:13.5px}
 .row-btns{display:flex;gap:8px;margin-top:8px}
 .row-btns .secondary{flex:1;margin:0}
+.ssh-grid{display:grid;grid-template-columns:1fr 64px;gap:8px}
+.ssh-grid input{grid-column:1/-1}
+.ssh-grid input:nth-child(2){grid-column:2;grid-row:1}
+.ssh-grid input:nth-child(1){grid-column:1;grid-row:1}
 /* Claude-style compact one-liners: slim rows, no card chrome */
 .tool-activity.compact{width:100%;max-width:94%;border:0;background:transparent;box-shadow:none;border-radius:10px;margin:2px 0;overflow:visible}
 .tool-activity.compact .tool-activity-head{min-height:30px;padding:3px 8px;border-bottom:0;border-radius:8px;cursor:pointer}

@@ -35,6 +35,17 @@ class MainActivity : ComponentActivity() {
     // child of workspaceRoot rather than needing its own tree permission.
     private var projectIsWorkspaceChild: Boolean = false
 
+    /** SSH for the agent: connect/exec/upload/download over one persistent
+     *  session. Reads/writes local files through the same SAF roots the fs
+     *  bridge uses, so "upload src/main.py" just works against the project. */
+    private val sshManager by lazy {
+        SshManager(
+            this,
+            readLocal = { path -> readProjectBytes(path) },
+            writeLocal = { path, bytes -> writeProjectBytes(path, bytes) }
+        )
+    }
+
     @Volatile private var activeRequests = 0
     private var wakeLock: PowerManager.WakeLock? = null
 
@@ -172,6 +183,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        try { sshManager.disconnect { _, _, _ -> } } catch (_: Exception) {}
         webView.removeJavascriptInterface("Android")
         webView.stopLoading()
         webView.destroy()
@@ -516,6 +528,29 @@ class MainActivity : ComponentActivity() {
         return dir.findFile(parts.last())
     }
 
+    /* ── SSH local-file helpers (same "workspace:" routing as runFs) ── */
+
+    private fun sshLocalRoot(path: String): DocumentFile? {
+        if (path.startsWith("workspace:")) return workspaceRoot
+        return projectRoot ?: workspaceRoot
+    }
+
+    private fun readProjectBytes(rawPath: String): ByteArray? = try {
+        val root = sshLocalRoot(rawPath) ?: return null
+        val path = if (rawPath.startsWith("workspace:")) rawPath.removePrefix("workspace:") else rawPath
+        val f = root.findFileRecursive(path) ?: return null
+        contentResolver.openInputStream(f.uri)?.use { it.readBytes() }
+    } catch (_: Exception) { null }
+
+    private fun writeProjectBytes(rawPath: String, bytes: ByteArray): Boolean = try {
+        val root = sshLocalRoot(rawPath) ?: return false
+        val path = if (rawPath.startsWith("workspace:")) rawPath.removePrefix("workspace:") else rawPath
+        val name = path.substringAfterLast('/')
+        val dir = resolveDir(root, path.substringBeforeLast('/', ""), create = true) ?: return false
+        val targetFile = dir.findFile(name) ?: dir.createFile("application/octet-stream", name) ?: return false
+        contentResolver.openOutputStream(targetFile.uri, "wt")?.use { it.write(bytes) } != null
+    } catch (_: Exception) { false }
+
     inner class AndroidBridge {
         // cb id -> live connection, so a stream can be aborted from JS mid-flight.
         private val activeStreams = java.util.concurrent.ConcurrentHashMap<String, HttpURLConnection>()
@@ -648,6 +683,81 @@ class MainActivity : ComponentActivity() {
 
         @JavascriptInterface
         fun fsDelete(path: String, cb: String) { runFs("delete", path, "", cb) }
+
+        /* ── SSH bridge: connect / exec / upload / download ──
+         * Output streams to JS line by line via window.__sshData(cbId, line),
+         * completion via window.__sshDone(cbId, code, message, error) — same
+         * shape as the SSE stream callbacks above. */
+
+        private fun sshCallback(cb: String, code: Int, msg: String, error: Boolean) {
+            js("window.__sshDone && window.__sshDone(${jsonString(cb)}, $code, ${jsonString(msg)}, $error)")
+        }
+
+        private fun sshLine(cb: String, line: String) {
+            js("window.__sshData && window.__sshData(${jsonString(cb)}, ${jsonString(line)})")
+        }
+
+        /** paramsJson: {host,port,user,password,privateKeyB64,passphrase,save}; empty = reconnect saved */
+        @JavascriptInterface
+        fun sshConnect(paramsJson: String, cb: String) {
+            beginRequest()
+            sshManager.connect(paramsJson,
+                onLine = { sshLine(cb, it) },
+                onDone = { code, msg, err -> sshCallback(cb, code, msg, err); endRequest() })
+        }
+
+        @JavascriptInterface
+        fun sshDisconnect(cb: String) {
+            sshManager.disconnect { code, msg, err -> sshCallback(cb, code, msg, err) }
+        }
+
+        @JavascriptInterface
+        fun sshIsConnected(): Boolean = sshManager.isConnected
+
+        /** Streams output lines to JS as they arrive; auto-reconnects saved session if dead. */
+        @JavascriptInterface
+        fun sshExec(command: String, timeoutSec: Int, cb: String) {
+            beginRequest()
+            if (!sshManager.isConnected) {
+                // Auto-reconnect with saved credentials, then run.
+                sshManager.connect("",
+                    onLine = {},
+                    onDone = { code, msg, err ->
+                        if (err) { sshCallback(cb, code, msg, err); endRequest() }
+                        else sshManager.exec(command, timeoutSec,
+                            onLine = { sshLine(cb, it) },
+                            onDone = { c2, m2, e2 -> sshCallback(cb, c2, m2, e2); endRequest() })
+                    })
+            } else {
+                sshManager.exec(command, timeoutSec,
+                    onLine = { sshLine(cb, it) },
+                    onDone = { code, msg, err -> sshCallback(cb, code, msg, err); endRequest() })
+            }
+        }
+
+        @JavascriptInterface
+        fun sshUpload(localPath: String, remotePath: String, cb: String) {
+            beginRequest()
+            sshManager.upload(localPath, remotePath,
+                onLine = { sshLine(cb, it) },
+                onDone = { code, msg, err -> sshCallback(cb, code, msg, err); endRequest() })
+        }
+
+        @JavascriptInterface
+        fun sshDownload(remotePath: String, localPath: String, cb: String) {
+            beginRequest()
+            sshManager.download(remotePath, localPath,
+                onLine = { sshLine(cb, it) },
+                onDone = { code, msg, err -> sshCallback(cb, code, msg, err); endRequest() })
+        }
+
+        /** Saved SSH config for the settings UI: {host,port,user} or null. */
+        @JavascriptInterface
+        fun sshSavedHost(): String = sshManager.savedConfig() ?: ""
+
+        /** Forget saved credentials and drop the session. */
+        @JavascriptInterface
+        fun sshForget() { sshManager.clearConfig() }
 
         /**
          * Streaming SSE variant: reads text/event-stream line by line and forwards
