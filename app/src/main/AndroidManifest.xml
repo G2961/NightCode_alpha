@@ -1,6 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Lets the bridge hold a partial wake lock while a request is in
+         flight: without it the process drops to cached state when
+         backgrounded, the cached-app freezer freezes it and Android kills
+         the in-flight TCP socket -> mid-stream "network error". -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <application
         android:allowBackup="true"

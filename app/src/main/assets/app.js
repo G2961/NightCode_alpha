@@ -983,6 +983,10 @@ async function send(override,targetId){
       +(ghToolsAvailable()?" GitHub is authenticated: use github_api for repositories, files (GET /repos/{owner}/{repo}/contents/{path}), issues, PRs, releases and search as the user.":"")
       +(state.summary?`\nConversation summary:\n${state.summary}\nContinue the same conversation.`:"");
     let final="";const toolCalls=[];let allThinking="";
+    // In-flight turn text: `final` only fills after a CLEAN turn end, so a
+    // mid-stream death (socket killed while backgrounded) used to lose the
+    // visible answer. This buffer always holds the current turn's partial.
+    let turnText="";
     let liveCard=null;
     // Live answer bubble: text tokens render in place as they stream, so the
     // answer appears WHILE the model works — not as one lump at the very end.
@@ -1029,12 +1033,18 @@ async function send(override,targetId){
       // slow and providers cut it off on long answers.
       const blocks={};          // index -> {type,id,name,inputJson}
       let stopReason=null;
+      turnText="";
       const data={content:[]};
       const r=await withRetry(()=>httpStream("POST",reqUrl,{"content-type":"application/json","x-api-key":state.key,"anthropic-version":"2023-06-01"},JSON.stringify(body),chunk=>{
         try{
           const ev=JSON.parse(chunk);
           const tt=document.getElementById("liveTitle");
           if(ev.type==="message_start"){
+            // A retry attempt re-streams the WHOLE message from scratch:
+            // drop stale accumulators or the next attempt would duplicate
+            // every delta the failed attempt already delivered.
+            for(const k in blocks)delete blocks[k];
+            turnText="";allThinking="";
             const u=(ev.message||{}).usage;
             if(u)updateUsage(u);
           }
@@ -1054,6 +1064,7 @@ async function send(override,targetId){
             }
             if(d.text){
               if(blocks[ev.index])blocks[ev.index].text=(blocks[ev.index].text||"")+d.text;
+              turnText+=d.text;
               removeTyping();
               if(liveCard&&tt)tt.textContent="Writing…";
               ensureLiveBubble();
@@ -1069,7 +1080,7 @@ async function send(override,targetId){
       }));
       if(r.cancelled){
         hideLiveCard();
-        const partial=final.trim();
+        const partial=(final.trim()+"\n\n"+turnText.trim()).trim();
         const lm=commitAssistantReply(partial||"⏹ Generation stopped.",targetId);
         if(allThinking)lm.thinking=allThinking;
         lm.reasoning=Date.now()-started;save();render();
@@ -1084,7 +1095,7 @@ async function send(override,targetId){
         // Keep whatever streamed in: show partial thinking instead of dropping it.
         if(final||allThinking){
           hideLiveCard();
-          const partial=final.trim();
+          const partial=(final.trim()+"\n\n"+turnText.trim()).trim();
           const lm=commitAssistantReply(partial||"⚠️ Поток оборвался после размышлений (HTTP "+r.status+"). Попробуй ещё раз.",targetId);
           if(allThinking)lm.thinking=allThinking;
           lm.reasoning=Date.now()-started;save();render();
@@ -1126,6 +1137,7 @@ async function send(override,targetId){
       const text=content.filter(x=>x.type==="text").map(x=>x.text).join("\n");
       if(reasoning)allThinking+=(allThinking?"\n\n":"")+reasoning.trim();
       if(text)final+=(final?"\n\n":"")+text;
+      turnText=""; // committed into final; buffer is for the next turn only
       if(!toolUses.length)break;
       messages.push({role:"assistant",content});
       const results=[];
@@ -1161,8 +1173,14 @@ async function send(override,targetId){
     console.error("[NightCode] send failed "+JSON.stringify({name:e&&e.name,message:String(e&&e.message||e).slice(0,1500),stack:String(e&&e.stack||"").slice(0,800)}));
     // If the model streamed any thinking/text before dying, keep it visible
     // instead of letting it vanish with the live card.
-    if(typeof allThinking!=='undefined'&&allThinking||typeof final!=='undefined'&&final.trim()){
-      const lm=commitAssistantReply((final&&final.trim())||"⚠️ "+(e.message||e),targetId);
+    // Rebuild the partial from committed text + in-flight buffer: deltas only
+    // reach `final` after a clean turn end, so a mid-stream crash used to
+    // commit an empty answer and the visible text vanished.
+    const pFinal=(typeof final!=='undefined')?final.trim():"";
+    const pTurn=(typeof turnText!=='undefined')?turnText.trim():"";
+    const streamedPartial=(pFinal+(pFinal&&pTurn?"\n\n":"")+pTurn).trim();
+    if((typeof allThinking!=='undefined'&&allThinking)||streamedPartial){
+      const lm=commitAssistantReply(streamedPartial||"⚠️ "+(e.message||e),targetId);
       if(typeof allThinking!=='undefined'&&allThinking)lm.thinking=allThinking;
       lm.reasoning=Date.now()-started;save();render();
     }else{
