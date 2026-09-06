@@ -63,6 +63,7 @@ class MainActivity : ComponentActivity() {
                         acquire(10 * 60 * 1000L) // 10 min safety cap
                     }
                 } catch (_: Exception) {}
+                startStreamService()
             }
         }
     }
@@ -74,8 +75,31 @@ class MainActivity : ComponentActivity() {
                 activeRequests = 0
                 try { wakeLock?.takeIf { it.isHeld }?.release() } catch (_: Exception) {}
                 wakeLock = null
+                stopStreamService()
             }
         }
+    }
+
+    /** Foreground service keeps the process out of the cached-app freezer's
+     *  reach while a stream is in flight — wake lock alone was not enough. */
+    private fun startStreamService() {
+        try {
+            val intent = Intent(this, StreamKeeperService::class.java)
+            if (android.os.Build.VERSION.SDK_INT >= 26) {
+                startForegroundService(intent)
+            } else {
+                startService(intent)
+            }
+        } catch (_: Exception) {}
+    }
+
+    private fun stopStreamService() {
+        try {
+            startService(
+                Intent(this, StreamKeeperService::class.java)
+                    .setAction(StreamKeeperService.ACTION_STOP)
+            )
+        } catch (_: Exception) {}
     }
 
     @Volatile private var sysStatus = 0

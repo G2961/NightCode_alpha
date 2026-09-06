@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="stream_channel_name">Streaming</string>
+    <string name="stream_channel_desc">Keeps an in-flight AI stream alive while the app is in the background.</string>
+    <string name="stream_notification_title">NightCode</string>
+    <string name="stream_notification_text">Stream in progress…</string>
+</resources>
