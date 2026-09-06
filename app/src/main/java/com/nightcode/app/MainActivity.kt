@@ -81,7 +81,9 @@ class MainActivity : ComponentActivity() {
     }
 
     /** Foreground service keeps the process out of the cached-app freezer's
-     *  reach while a stream is in flight — wake lock alone was not enough. */
+     *  reach while a stream is in flight — wake lock alone was not enough.
+     *  Bulletproof: FGS-from-background throws ForegroundServiceStartNotAllowedException
+     *  on Android 12+; swallow it and retry when the app next comes foreground. */
     private fun startStreamService() {
         try {
             val intent = Intent(this, StreamKeeperService::class.java)
@@ -91,6 +93,37 @@ class MainActivity : ComponentActivity() {
                 startService(intent)
             }
         } catch (_: Exception) {}
+    }
+
+    /**
+     * Agent-turn brackets. The FGS must live for the WHOLE agent turn — streams,
+     * tool executions (SSH/web/GitHub) and the gaps between them — not just a
+     * single HTTP request. Without this, the service stopped between tools,
+     * the process dropped to cached state and the freezer killed open SSH
+     * sockets mid-turn ("network dropped" + crash on retry from background).
+     * JS calls agentTurnBegin() once per user message, agentTurnEnd() in finally.
+     */
+    private var agentTurnRequests = 0
+
+    @JavascriptInterface
+    fun agentTurnBegin() {
+        synchronized(this) {
+            agentTurnRequests++
+            if (agentTurnRequests == 1) {
+                startStreamService()
+            }
+        }
+    }
+
+    @JavascriptInterface
+    fun agentTurnEnd() {
+        synchronized(this) {
+            agentTurnRequests--
+            if (agentTurnRequests <= 0) {
+                agentTurnRequests = 0
+                stopStreamService()
+            }
+      }
     }
 
     private fun stopStreamService() {

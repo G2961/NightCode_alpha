@@ -22,6 +22,18 @@ import android.os.IBinder
  */
 class StreamKeeperService : Service() {
 
+    /** Re-acquire the wake lock periodically: a single acquire() has a 10-min
+     *  safety cap, long agent turns (8x streams + tools) outlive it. */
+    private val handler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val relock = object : Runnable {
+        override fun run() {
+            try {
+                wakeLock?.takeIf { !it.isHeld }?.acquire(10 * 60 * 1000L)
+            } catch (_: Exception) {}
+            handler.postDelayed(this, 5 * 60 * 1000L)
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
@@ -39,6 +51,7 @@ class StreamKeeperService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
             stopForeground(STOP_FOREGROUND_REMOVE)
+            handler.removeCallbacks(relock)
             stopSelf()
             return START_NOT_STICKY
         }
@@ -58,8 +71,12 @@ class StreamKeeperService : Service() {
             .build()
         if (Build.VERSION.SDK_INT >= 29) {
             startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+            handler.removeCallbacks(relock)
+            handler.postDelayed(relock, 5 * 60 * 1000L)
         } else {
             startForeground(NOTIFICATION_ID, notification)
+            handler.removeCallbacks(relock)
+            handler.postDelayed(relock, 5 * 60 * 1000L)
         }
         return START_NOT_STICKY
     }

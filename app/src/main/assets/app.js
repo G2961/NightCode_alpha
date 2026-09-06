@@ -184,6 +184,12 @@ function messageHtml(m,idx){
   const showBubble=m.text||m.role!=="user";
   if(!showBubble)return `<div class="message ${m.role}">${files}</div>`;
   const tools=(m.tools||[]).map(t=>`<details class="tool-activity compact"><summary class="tool-activity-head"><div class="tool-activity-icon sm">${toolIcon(t.name)}</div><div class="tool-activity-text"><div class="tool-activity-title">${esc(toolCompactLabel(t))}</div></div><div class="reasoning-chevron"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg></div></summary><div class="tool-preview">${toolPreview(t.name,t.input,t.result)}</div></details>`).join("");
+  // Blocks are the canonical format: [{text},{tool},{text},...] rendered in
+  // order inside ONE bubble ￢ﾀﾔ like Claude Code's transcript. m.text stays as
+  // the plain-text fallback (legacy chats, search, export).
+  const blockToolHtml=t=>`<details class="tool-activity compact"><summary class="tool-activity-head"><div class="tool-activity-icon sm">${toolIcon(t.name)}</div><div class="tool-activity-text"><div class="tool-activity-title">${esc(toolCompactLabel(t))}</div></div><div class="reasoning-chevron"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg></div></summary><div class="tool-preview">${toolPreview(t.name,t.input,t.result)}</div></details>`;
+  const blocks=m.blocks||[];
+  const blockHtml=blocks.length?`<div class="bubble-blocks">${blocks.map(b=>b.tool?blockToolHtml(b.tool):`<div class="bubble-block-text">${md(b.text||"",{reasoningDurationMs:m.reasoning})}</div>`).join("")}</div>`:"";
   const time=m.ts?`<div class="msg-time">${new Date(m.ts).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})}</div>`:"";
   // Thinking arrives as its own field (collected from the API's thinking blocks) —
   // rendered as an agent-style collapsible card ABOVE the bubble. Never merged
@@ -202,7 +208,7 @@ function messageHtml(m,idx){
     }
   }
   const bodyText=m.text;
-  const bubbleHtml=m.role==="assistant"?md(bodyText,{reasoningDurationMs:m.reasoning}):esc(m.text||"");
+  const bubbleHtml=blocks.length?"":(m.role==="assistant"?md(bodyText,{reasoningDurationMs:m.reasoning}):esc(m.text||""));
   const retryBtn=m.role==="assistant"?`<button class="msg-act-btn" data-act="retry" aria-label="Retry"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 1 3 6.7"/><path d="M3 21v-6h6"/></svg></button>`:"";
   const editBtn=m.role==="user"?`<button class="msg-act-btn" data-act="edit" aria-label="Edit"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg></button>`:"";
   const actions=`<div class="msg-actions"><button class="msg-act-btn" data-act="copy" aria-label="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></svg></button>${editBtn}${retryBtn}</div>`;
@@ -212,7 +218,7 @@ function messageHtml(m,idx){
     <span class="msg-variant-count">${sib.index}/${sib.total}</span>
     <button class="msg-act-btn" data-act="nextVariant" ${sib.index>=sib.total?"disabled":""} aria-label="Next variant"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg></button>
   </div>`:"";
-  return `<div class="message ${m.role}" data-idx="${idx}">${files}${tools}${reasoningHtml}<div class="bubble">${bubbleHtml}</div>${time}${switcherHtml}${actions}</div>`;
+  return `<div class="message ${m.role}" data-idx="${idx}">${files}${tools}${reasoningHtml}${blockHtml}<div class="bubble" style="${blocks.length?"display:none":""}">${bubbleHtml}</div>${time}${switcherHtml}${actions}</div>`;
 }
 function render(){
   const chat=$("chat");
