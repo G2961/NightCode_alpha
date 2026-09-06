@@ -948,6 +948,23 @@ async function send(override,targetId){
   $("sendBtn").classList.add("stop");
   showTyping();
   const started=Date.now();
+  // ---- Agent turn bracket: keep the FGS alive for the WHOLE turn (stream +
+  // tool execution + pauses), not just one HTTP request. Without this the
+  // process went cached between tool calls ￢ﾀﾔ the freezer killed live SSH
+  // sockets and the WebView died mid-tool ("network dropped" while minimized).
+  const bridge=window.Android;
+  try{bridge&&bridge.agentTurnBegin()}catch(e){}
+  let draftTimer=null;const DRAFT_KEY="turnDraft";
+  const clearDraft=()=>{try{localStorage.removeItem(DRAFT_KEY)}catch(e){}};
+  // Persist the in-flight turn (thinking + text + tool cards) on every change:
+  // a crash/app-kill must never eat the reasoning the user watched stream.
+  const writeDraft=()=>{
+    try{
+      const draft={text:(final+"\n\n"+turnText).trim(),thinking:allThinking,tools:toolCalls,ts:Date.now()};
+      localStorage.setItem(DRAFT_KEY,JSON.stringify(draft));
+    }catch(e){}
+  };
+  const schedDraft=()=>{clearTimeout(draftTimer);draftTimer=setTimeout(writeDraft,400)};
   try{
     compactIfNeeded();
     // History must never contain thinking blocks — models reject foreign tags on the way back.
@@ -1023,6 +1040,7 @@ async function send(override,targetId){
     const hideLiveCard=()=>{if(liveCard){liveCard.closest(".message").remove();liveCard=null}};
     _hideLiveCardFn=()=>{hideLiveCard();hideLiveBubble()};
     for(let turn=0;turn<8;turn++){
+      if(turn>0)schedDraft();  // tool results landed ￢ﾀﾔ snapshot before next stream
       const lim=getCtxLimits();
       const body={model:state.selected,max_tokens:Number(lim.output)||6000,system,messages,stream:true};
       // Web tools always available; file tools with a connected project OR a
@@ -1067,6 +1085,7 @@ async function send(override,targetId){
               const tb=document.getElementById("liveBody");
               if(tb){tb.textContent=allThinking.slice(-3000);tb.scrollTop=tb.scrollHeight}
               autoScroll();
+              schedDraft();
             }
             if(d.text){
               if(blocks[ev.index])blocks[ev.index].text=(blocks[ev.index].text||"")+d.text;
@@ -1076,6 +1095,7 @@ async function send(override,targetId){
               ensureLiveBubble();
               if(liveBubbleText){liveBubbleText.textContent+=d.text;if(liveBubbleText.textContent.length>4000)liveBubbleText.textContent=liveBubbleText.textContent.slice(-4000)}
               autoScroll();
+              schedDraft();
             }
             if(d.partial_json&&blocks[ev.index])blocks[ev.index].inputJson+=d.partial_json;
           }
@@ -1148,8 +1168,9 @@ async function send(override,targetId){
       messages.push({role:"assistant",content});
       const results=[];
       for(const u of toolUses){
-        hideLiveBubble();
-        const activity=showToolActivity(u.name,u.input||{});
+        // Tool cards render INSIDE the live bubble, between text segments ￢ﾀﾔ
+        // nothing disappears when a tool starts running (Claude Code style).
+        const activity=showToolActivity(u.name,u.input||{},liveBubbleText);
         let out,err=false;
         try{
           const res=await runTool(u.name,u.input||{});
@@ -1158,6 +1179,7 @@ async function send(override,targetId){
         }catch(e){out=String(e.message||e);err=true;activity.update(out,true)}
         fireExt("tool",{name:u.name,input:u.input||{},result:String(out),error:err});
         toolCalls.push({name:u.name,input:u.input||{},result:String(out),error:err});
+        schedDraft();
         results.push({type:"tool_result",tool_use_id:u.id,is_error:err,content:String(out)});
       }
       messages.push({role:"user",content:results});
@@ -1171,7 +1193,16 @@ async function send(override,targetId){
     const last=commitAssistantReply(finalText,targetId);
     last.reasoning=Date.now()-started;
     if(allThinking.trim())last.thinking=allThinking.trim();
-    if(toolCalls.length)last.tools=toolCalls;
+    if(toolCalls.length){
+      last.tools=toolCalls;
+      // Canonical block transcript: [{text},{tool},{text},...]. The "final"
+      // text is the LAST block; earlier text segments stay where they streamed.
+      const bl=[];
+      for(const t of toolCalls)bl.push({tool:t});
+      bl.push({text:finalText});
+      last.blocks=bl;
+    }
+    clearDraft();
     save();render();
   }catch(e){
     removeTyping();
@@ -1193,7 +1224,11 @@ async function send(override,targetId){
       commitAssistantReply("Error: "+(e.message||e),targetId);
     }
   }
-  finally{$("sendBtn").classList.remove("stop");hideLiveCardSafe()}
+  finally{
+    $("sendBtn").classList.remove("stop");hideLiveCardSafe();
+    clearTimeout(draftTimer);
+    try{bridge&&bridge.agentTurnEnd()}catch(e){}
+  }
 }
 let _hideLiveCardFn=null;
 function hideLiveCardSafe(){if(_hideLiveCardFn)_hideLiveCardFn()}
