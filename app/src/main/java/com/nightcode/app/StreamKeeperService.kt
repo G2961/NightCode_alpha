@@ -8,27 +8,25 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 
 /**
- * Foreground service that runs only while an HTTP stream / SSH request is in
- * flight. A backgrounded app is a candidate for the cached-app freezer; a
- * foreground service takes the process out of cached state, so streams keep
- * running with the app minimized. (A plain partial wake lock proved NOT to be
- * enough: the freezer still froze the process and killed the in-flight TCP
- * socket mid-stream.)
+ * Foreground service that runs while an agent turn is in flight (stream,
+ * tool calls, pauses in between). A backgrounded app is a candidate for the
+ * cached-app freezer; a foreground service takes the process out of cached
+ * state, so streams and SSH sockets survive the app being minimized.
  *
- * The service is started/stopped by MainActivity.beginRequest()/endRequest()
- * via the static start/stop helpers; it never runs on its own.
+ * Started/stopped by MainActivity via the static start/stop helpers.
  */
 class StreamKeeperService : Service() {
 
-    /** Re-acquire the wake lock periodically: a single acquire() has a 10-min
-     *  safety cap, long agent turns (8x streams + tools) outlive it. */
+    private var wakeLock: PowerManager.WakeLock? = null
+
     private val handler = android.os.Handler(android.os.Looper.getMainLooper())
     private val relock = object : Runnable {
         override fun run() {
             try {
-                wakeLock?.takeIf { !it.isHeld }?.acquire(10 * 60 * 1000L)
+                wakeLock?.takeIf { !it.isHeld }?.acquire(30 * 60 * 1000L)
             } catch (_: Exception) {}
             handler.postDelayed(this, 5 * 60 * 1000L)
         }
@@ -50,11 +48,13 @@ class StreamKeeperService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
-            stopForeground(STOP_FOREGROUND_REMOVE)
             handler.removeCallbacks(relock)
+            releaseWakeLock()
+            stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
             return START_NOT_STICKY
         }
+        acquireWakeLock()
         val notification = Notification.Builder(this, CHANNEL_ID)
             .setContentTitle(getString(R.string.stream_notification_title))
             .setContentText(getString(R.string.stream_notification_text))
@@ -71,14 +71,35 @@ class StreamKeeperService : Service() {
             .build()
         if (Build.VERSION.SDK_INT >= 29) {
             startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
-            handler.removeCallbacks(relock)
-            handler.postDelayed(relock, 5 * 60 * 1000L)
         } else {
             startForeground(NOTIFICATION_ID, notification)
-            handler.removeCallbacks(relock)
-            handler.postDelayed(relock, 5 * 60 * 1000L)
         }
+        handler.removeCallbacks(relock)
+        handler.postDelayed(relock, 5 * 60 * 1000L)
         return START_NOT_STICKY
+    }
+
+    private fun acquireWakeLock() {
+        try {
+            val pm = getSystemService(POWER_SERVICE) as PowerManager
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "nightcode:streamkeeper").apply {
+                setReferenceCounted(false)
+                acquire(30 * 60 * 1000L)
+            }
+        } catch (_: Exception) {}
+    }
+
+    private fun releaseWakeLock() {
+        try {
+            wakeLock?.takeIf { it.isHeld }?.release()
+        } catch (_: Exception) {}
+        wakeLock = null
+    }
+
+    override fun onDestroy() {
+        handler.removeCallbacks(relock)
+        releaseWakeLock()
+        super.onDestroy()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
