@@ -2474,6 +2474,23 @@ $("input").addEventListener("input",updateSlashMenu)
 $("input").addEventListener("keydown",e=>{if(e.key==="Escape"){$("slashMenu").classList.remove("show")}})
 $("input").addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();send()}})
 initProjectState();render();renderAttachments();resizeInput();updateModelBtn();renderCtxRing();renderRecent();loadExtensions();
+// Restore an in-flight turn that died mid-flight (crash, renderer kill, app kill):
+// surface it as a message bubble so the user can hit "continue" with full context.
+try{
+  const rawDraft=localStorage.getItem("turnDraft");
+  if(rawDraft){
+    const d=JSON.parse(rawDraft);
+    if(d&&(d.text||d.thinking)&&Date.now()-(d.ts||0)<36e5){
+      const parts=[];
+      if(d.thinking)parts.push("<think>"+d.thinking+"</think>");
+      if(d.text)parts.push(d.text);
+      const m={id:"draft-"+Date.now(),role:"assistant",text:parts.join("\n\n"),ts:d.ts||Date.now(),
+        meta:"￰ﾟﾑﾌ Restore after disconnect"};
+      state.messages.push(m);save();render();
+      localStorage.removeItem("turnDraft");
+    }
+  }
+}catch(e){}
 {const c=$("chat");if(c)lastChatClientHeight=c.clientHeight}
 
 /* ── Keyboard-aware scrolling ───────── */

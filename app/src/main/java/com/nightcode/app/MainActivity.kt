@@ -11,6 +11,7 @@ import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebViewClient
 import java.net.HttpURLConnection
 import java.net.URL
@@ -185,6 +186,16 @@ class MainActivity : ComponentActivity() {
                 ): Boolean {
                     val url = request.url.toString()
                     return !(url.startsWith("http://") || url.startsWith("https://"))
+                }
+
+                override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
+                    // WebView renderer process died in background (Android kills it to
+                    // reclaim memory). Without this the WebView stays a grey void
+                    // forever. Recreate it and reload: app.js restores the turn draft
+                    // from localStorage, so the conversation context survives.
+                    Log.e("NightCode", "WebView renderer gone: ${detail.didCrash()}")
+                    recreate()
+                    return true
                 }
 
                 override fun onPageFinished(view: WebView, url: String) {
